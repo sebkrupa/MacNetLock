@@ -1,0 +1,146 @@
+#!/bin/bash
+# netlock-apps - pick the apps netlock lets through. Left column: allowed,
+# right column: other installed apps. Saves one app name per line to
+# ~/.config/netlock/allow, which netlock reads on start. Run without sudo.
+# Keys: Tab or left/right = column, up/down = move, Space = move app to the
+# other column, type = filter, Backspace = edit filter, Enter = save and quit,
+# Esc = quit without saving. Written for the stock /bin/bash 3.2.
+# Every line is cut to the terminal width and the last row gets no newline:
+# a wrapped or extra line would scroll the screen on each redraw.
+
+CONFIG="$HOME/.config/netlock/allow"
+[[ -t 0 && -t 1 ]] || { echo "netlock-apps needs a terminal" >&2; exit 1; }
+
+LEFT=() RIGHT=() VL=() VR=()
+COL=1          # start on the right column: that is where apps get picked from
+CUR=(0 0)
+OFF=(0 0)
+FILTER=""
+DIRTY=0
+ROWS=10 W=30
+
+if [[ -r $CONFIG ]]; then
+  while IFS= read -r l || [[ -n $l ]]; do
+    [[ -n $l && $l != \#* ]] && LEFT+=("$l")
+  done < "$CONFIG"
+fi
+while IFS= read -r name; do
+  [[ -n $name ]] || continue
+  found=0
+  for a in "${LEFT[@]}"; do [[ $a == "$name" ]] && { found=1; break; }; done
+  (( found )) || RIGHT+=("$name")
+done < <(for d in /Applications "$HOME/Applications" /System/Applications /System/Applications/Utilities; do
+           [[ -d $d ]] && ls "$d" 2>/dev/null | sed -n 's/\.app$//p'
+         done | sort -fu)
+
+resort() {   # L | R : sort that column
+  local -a src=() tmp=(); local l
+  if [[ $1 == L ]]; then src=("${LEFT[@]}"); else src=("${RIGHT[@]}"); fi
+  (( ${#src[@]} )) && while IFS= read -r l; do tmp+=("$l"); done < <(printf '%s\n' "${src[@]}" | sort -f)
+  if [[ $1 == L ]]; then LEFT=("${tmp[@]}"); else RIGHT=("${tmp[@]}"); fi
+}
+
+remove() {   # L | R , name : drop one entry from that column
+  local -a src=() tmp=(); local a
+  if [[ $1 == L ]]; then src=("${LEFT[@]}"); else src=("${RIGHT[@]}"); fi
+  for a in "${src[@]}"; do [[ $a == "$2" ]] || tmp+=("$a"); done
+  if [[ $1 == L ]]; then LEFT=("${tmp[@]}"); else RIGHT=("${tmp[@]}"); fi
+}
+
+move() {   # move the app under the cursor to the other column
+  local name
+  if (( COL == 0 )); then
+    (( ${#VL[@]} )) || return 0
+    name=${VL[${CUR[0]}]}
+    remove L "$name"; RIGHT+=("$name"); resort R
+  else
+    (( ${#VR[@]} )) || return 0
+    name=${VR[${CUR[1]}]}
+    remove R "$name"; LEFT+=("$name"); resort L
+  fi
+  DIRTY=1
+}
+
+build_vis() {   # apply the filter to both columns
+  local a
+  VL=() VR=()
+  shopt -s nocasematch
+  for a in "${LEFT[@]}";  do [[ -z $FILTER || $a == *"$FILTER"* ]] && VL+=("$a"); done
+  for a in "${RIGHT[@]}"; do [[ -z $FILTER || $a == *"$FILTER"* ]] && VR+=("$a"); done
+  shopt -u nocasematch
+}
+
+clamp() {   # column : keep cursor and scroll offset inside the visible list
+  local n c=${CUR[$1]} o=${OFF[$1]}
+  if (( $1 == 0 )); then n=${#VL[@]}; else n=${#VR[@]}; fi
+  (( c >= n )) && c=$((n - 1))
+  (( c < 0 )) && c=0
+  (( c < o )) && o=$c
+  (( c >= o + ROWS )) && o=$((c - ROWS + 1))
+  (( o < 0 )) && o=0
+  CUR[$1]=$c; OFF[$1]=$o
+}
+
+cell() {   # column, index, name : one padded cell, highlighted under the cursor
+  local text; text=$(printf '%-*s' "$W" "${3:0:$W}")
+  if (( COL == $1 && $2 == CUR[$1] )); then printf '\033[7m%s\033[0m' "$text"; else printf '%s' "$text"; fi
+}
+
+draw() {
+  local i li ri lines cols t1 t2 size
+  size=$(stty size </dev/tty 2>/dev/null) || size="24 80"
+  lines=${size% *} cols=${size#* }
+  ROWS=$((lines - 5)); (( ROWS < 3 )) && ROWS=3
+  W=$(((cols - 4) / 2)); (( W < 10 )) && W=10
+  build_vis; clamp 0; clamp 1
+  t1="netlock-apps   Enter = SAVE and quit   Esc = quit WITHOUT saving"
+  (( DIRTY )) && t1+="   [unsaved changes]"
+  t2="Tab or arrows = column   up/down = move   Space = move app   type = filter: ${FILTER}_"
+  printf '\033[H'
+  printf '\033[1m%s\033[0m\033[K\n' "${t1:0:$cols}"
+  printf '%s\033[K\n\033[K\n' "${t2:0:$cols}"
+  printf '%-*s   %-*s\033[K' "$W" "ALLOWED (${#LEFT[@]})" "$W" "OTHER APPS (${#RIGHT[@]})"
+  for (( i = 0; i < ROWS; i++ )); do
+    li=$((OFF[0] + i)); ri=$((OFF[1] + i))
+    printf '\n%s │ %s\033[K' "$(cell 0 "$li" "${VL[$li]}")" "$(cell 1 "$ri" "${VR[$ri]}")"
+  done
+  printf '\033[J'
+}
+
+save() {
+  mkdir -p "$(dirname "$CONFIG")"
+  {
+    echo "# netlock: allowed apps, one per line. Edit with netlock-apps."
+    (( ${#LEFT[@]} )) && printf '%s\n' "${LEFT[@]}"
+  } > "$CONFIG"
+  echo "saved ${#LEFT[@]} allowed app(s) to $CONFIG"
+}
+
+finish() { tput cnorm; printf '\033[H\033[J'; }
+trap finish EXIT
+trap 'exit 130' INT TERM
+tput civis
+
+while :; do
+  draw
+  IFS= read -rsn1 key
+  case $key in
+    $'\e')
+      read -rsn2 -t 1 rest || rest=""
+      case $rest in
+        '[A'|'OA') (( CUR[COL]-- )) ;;
+        '[B'|'OB') (( CUR[COL]++ )) ;;
+        '[C'|'OC') COL=1 ;;
+        '[D'|'OD') COL=0 ;;
+        '')
+          finish; trap - EXIT
+          (( DIRTY )) && echo "changes discarded, nothing saved. Enter saves and quits."
+          exit 0 ;;
+      esac ;;
+    $'\t')          COL=$((1 - COL)) ;;
+    ' ')            move ;;
+    '')             finish; trap - EXIT; save; exit 0 ;;
+    $'\x7f'|$'\b')  FILTER=${FILTER%?} ;;
+    *)              [[ $key == [[:print:]] ]] && FILTER+=$key ;;
+  esac
+done

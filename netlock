@@ -1,0 +1,359 @@
+#!/bin/bash
+# netlock - block all network traffic on macOS except for chosen apps. Uses pf.
+# An allowed app is matched by process (any path containing /Name.app/, child
+# processes included), so it may already be running. Every POLL seconds netlock
+# lists the sockets of those processes (lsof) and loads pass rules for their
+# local ports into the pf anchor "netlock"; everything else stays blocked.
+# Needs root. Restores the default pf config on exit (Ctrl+C, SIGTERM, SIGHUP).
+# After a kill -9 run: sudo netlock restore
+# While running it shows live per-process traffic (nettop) since start.
+# Written for the stock /bin/bash 3.2.
+
+PFCONF=/etc/pf.conf
+ANCHOR=netlock
+POLL=0.5                            # TCP resends a lost SYN after 1 s, so a new socket is passed before that
+CONFIG_REL=.config/netlock/allow    # per user, written by netlock-apps
+
+ALLOW_APPS=()
+ALLOW_PORTS=(53)
+APP_MATCH=()        # one per allowed app: "/Name.app/" (substring of the process path) or an exact binary path
+DRY_RUN=0
+VERBOSE=0
+MONITOR=1
+
+WAS_ENABLED=0
+TOKEN=""
+ARMED=0
+RESTORED=0
+SLEEP_PID=""
+MON_PID=""
+PIDFILE=""
+LAST_RULES=""
+
+usage() {
+  cat <<USAGE
+usage:
+  sudo netlock [--allow <app>[,<app>...]] [--allow-port <port>[,...]] [--no-monitor] [--dry-run] [--verbose]
+  sudo netlock status    # pf state, netlock rules loaded?, ports currently passed
+  sudo netlock restore   # manual restore after kill -9 / crash
+
+<app>  name from /Applications, ~/Applications or /System/Applications (Firefox, Slack),
+       a path to a binary or .app bundle, or bundle:com.example.app
+Allowed apps may already be running. Their child processes count as the app.
+Apps listed in ~/.config/netlock/allow (pick them with netlock-apps, no sudo) are always allowed too.
+Without --allow and with an empty list everything except DNS (port 53) is blocked.
+While running, a live table shows traffic per process since start (--no-monitor turns it off).
+USAGE
+}
+
+log()  { echo "netlock: $*" >&2; }
+vlog() { (( VERBOSE )) && log "$@"; return 0; }
+die()  { log "$*"; exit 1; }
+
+need_root() { [[ $EUID -eq 0 ]] || die "must run as root: sudo netlock ..."; }
+user_home() { dscl . -read "/Users/${SUDO_USER:-$USER}" NFSHomeDirectory 2>/dev/null | awk '{print $2}'; }
+
+load_config() {   # apps picked with netlock-apps, merged with --allow
+  local f="$(user_home)/$CONFIG_REL" l
+  [[ -r $f ]] || return 0
+  while IFS= read -r l || [[ -n $l ]]; do
+    [[ -n $l && $l != \#* ]] && ALLOW_APPS+=("$l")
+  done < "$f"
+  vlog "config $f read"
+}
+
+# ------------------------------------------------------- app resolution
+resolve_app() {   # <spec> -> prints "/Name.app/" for an app bundle or the binary path, or fails
+  local spec=$1 app="" dir
+  case $spec in
+    bundle:*)
+      app=$(mdfind "kMDItemCFBundleIdentifier == '${spec#bundle:}'" 2>/dev/null | grep '\.app$' | head -n 1)
+      [[ -n $app ]] || return 1 ;;
+    /*)
+      if [[ -d $spec && $spec == *.app ]]; then app=$spec
+      elif [[ -f $spec && -x $spec ]]; then echo "$spec"; return 0
+      else return 1; fi ;;
+    *)
+      for dir in /Applications "$(user_home)/Applications" /System/Applications /System/Applications/Utilities; do
+        if [[ -d "$dir/$spec.app" ]]; then app="$dir/$spec.app"; break; fi
+      done
+      [[ -n $app ]] || return 1 ;;
+  esac
+  [[ -d "$app/Contents/MacOS" ]] || return 1
+  # System apps run from a Cryptex path, not /Applications, so match the bundle name anywhere in the path
+  echo "/$(basename "$app")/"
+}
+
+allowed_pids() {   # -> pids of every process of the allowed apps, children included
+  ps -axww -o pid=,ppid=,comm= | awk -v m="$(IFS="|"; echo "${APP_MATCH[*]}")" '
+    BEGIN { n = split(m, M, "|") }
+    {
+      pid = $1; parent[pid] = $2
+      comm = $0; sub(/^ *[0-9]+ +[0-9]+ +/, "", comm)
+      for (i = 1; i <= n; i++) {
+        if (M[i] == "") continue
+        if (M[i] ~ /\.app\/$/ ? index(comm, M[i]) > 0 : comm == M[i]) { hit[pid] = 1; break }
+      }
+    }
+    END {
+      do { more = 0; for (p in parent) if (!(p in hit) && (parent[p] in hit)) { hit[p] = 1; more = 1 } } while (more)
+      for (p in hit) print p
+    }'
+}
+
+anchor_rules() {   # pids... -> pf rules passing the local ports of their sockets, nothing if none
+  (( $# )) || return 0
+  lsof -a -n -P -i -p "$(IFS=,; echo "$*")" -F nP 2>/dev/null | awk '
+    /^P/ { proto = tolower(substr($0, 2)); next }
+    /^n/ {
+      local = substr($0, 2); sub(/->.*/, "", local)
+      port = local; sub(/.*:/, "", port)
+      if (port !~ /^[0-9]+$/ || (proto != "tcp" && proto != "udp") || ((proto, port) in seen)) next
+      seen[proto, port] = 1; ports[proto] = ports[proto] " " port
+    }
+    END {
+      # flags any: a connection that exists before its rule (app already running) is picked up mid-stream
+      if ("tcp" in ports) {
+        printf "pass out quick proto tcp from any port {%s } flags any\n", ports["tcp"]
+        printf "pass in quick proto tcp to any port {%s } flags any\n", ports["tcp"]
+      }
+      if ("udp" in ports) {
+        printf "pass out quick proto udp from any port {%s }\n", ports["udp"]
+        printf "pass in quick proto udp to any port {%s }\n", ports["udp"]
+      }
+    }'
+}
+
+refresh() {   # scan the allowed apps and reload the anchor when their port set changes
+  local pids rules
+  pids=$(allowed_pids)
+  printf '%s\n' $pids > "$PIDFILE"      # the monitor reads it for the * marker
+  rules=$(anchor_rules $pids | sort)
+  [[ $rules == "$LAST_RULES" ]] && return 0
+  if [[ -z $rules ]]; then
+    pfctl -q -a "$ANCHOR" -F rules 2>/dev/null
+  else
+    printf '%s\n' "$rules" | pfctl -q -a "$ANCHOR" -f - 2>/dev/null || log "warning: anchor reload failed"
+  fi
+  LAST_RULES=$rules
+  vlog "anchor reloaded: $(wc -w <<<"$pids" | tr -d ' ') processes"
+}
+
+# -------------------------------------------------------------- ruleset
+ruleset() {
+  cat <<RULES
+# netlock
+set skip on lo0
+pass out quick proto { tcp udp } to any port { ${ALLOW_PORTS[*]} }
+anchor "$ANCHOR"
+block drop out all
+block drop in all
+RULES
+}
+
+# -------------------------------------------------------------- restore
+restore() {
+  (( RESTORED )) && return 0
+  RESTORED=1
+  (( ARMED )) || return 0
+  pfctl -q -f "$PFCONF" 2>/dev/null || log "warning: could not reload $PFCONF"
+  pfctl -q -a "$ANCHOR" -F rules 2>/dev/null
+  if (( ! WAS_ENABLED )); then
+    # -X releases our reference; pf stays up only if something else (VPN) holds one
+    if [[ -n $TOKEN ]]; then pfctl -q -X "$TOKEN" 2>/dev/null; else pfctl -q -d 2>/dev/null; fi
+  fi
+  log "network restored"
+}
+
+cleanup() {
+  restore
+  [[ -n $SLEEP_PID ]] && kill "$SLEEP_PID" 2>/dev/null
+  if [[ -n $MON_PID ]]; then pkill -P "$MON_PID" 2>/dev/null; kill "$MON_PID" 2>/dev/null; fi
+  [[ -n $PIDFILE ]] && rm -f "$PIDFILE"
+  return 0
+}
+
+cmd_restore() {
+  need_root
+  pfctl -q -f "$PFCONF" 2>/dev/null || log "warning: could not reload $PFCONF"
+  pfctl -q -a "$ANCHOR" -F rules 2>/dev/null
+  pfctl -q -d 2>/dev/null
+  log "network restored (default ruleset loaded, pf disabled)"
+}
+
+# --------------------------------------------------------------- status
+cmd_status() {
+  need_root
+  if pfctl -s info 2>/dev/null | grep -q 'Status: Enabled'; then echo "pf: enabled"; else echo "pf: disabled"; fi
+  if pfctl -s rules 2>/dev/null | grep -q "^anchor \"$ANCHOR\""; then echo "netlock rules: loaded"; else echo "netlock rules: not loaded"; fi
+  echo "ports passed for allowed apps (anchor $ANCHOR):"
+  pfctl -a "$ANCHOR" -s rules 2>/dev/null | sed 's/^/  /' | grep . || echo "  (none)"
+}
+
+# -------------------------------------------------------------- monitor
+# Live per-process traffic since start, redrawn every second. nettop block-buffers
+# when writing to a pipe, so it runs under a pty (script). Its first sample is
+# cumulative since process start and is skipped; later samples are 1 s deltas.
+# -t external leaves out loopback, which pf never blocks. Every line is cut to
+# the terminal width: a wrapped line would scroll the screen on each redraw.
+monitor() {
+  local rows cols size
+  size=$(stty size </dev/tty 2>/dev/null) || size="24 80"   # not tput: inside $( ) it sees no tty
+  rows=$(( ${size% *} - 7 ))
+  (( rows < 5 )) && rows=5
+  cols=${size#* }
+  printf '\033[H\033[2J'
+  script -q /dev/null nettop -P -d -L 0 -s 1 -x -J bytes_in,bytes_out -t external </dev/null 2>/dev/null |
+  awk -v start="$(date +%s)" -v rows="$rows" -v cols="$cols" -v pidfile="$PIDFILE" \
+      -v allowed="${ALLOW_APPS[*]:-none}" -v ports="${ALLOW_PORTS[*]}" '
+    function human(b) {
+      if (b < 1024) return b " B"
+      if (b < 1048576) return sprintf("%.0f KB", b / 1024)
+      if (b < 1073741824) return sprintf("%.1f MB", b / 1048576)
+      return sprintf("%.2f GB", b / 1073741824)
+    }
+    function line(s) { printf "%s\033[K\n", substr(s, 1, cols) }
+    function draw(   cmd, l, k, t, max, w, bar, j, n, p, now, el, mark, row) {
+      delete okpid
+      while ((getline l < pidfile) > 0) okpid[l] = 1
+      close(pidfile)
+      "date +%s" | getline now; close("date +%s")
+      el = now - start
+      printf "\033[H"
+      line(sprintf("netlock  %s  (in %s, out %s)  up %02d:%02d:%02d   Ctrl+C restores network", human(tin + tout), human(tin), human(tout), el / 3600, (el % 3600) / 60, el % 60))
+      line("allowed: " allowed "   ports: " ports)
+      line("* = allowed app (has network)   no *: out = blocked retries, tiny in = DNS")
+      line("")
+      line(sprintf("%-17s %10s %10s %10s", "PROCESS", "IN", "OUT", "TOTAL"))
+      max = 0
+      for (k in tot) if (tot[k] > max) max = tot[k]
+      fflush()
+      cmd = "sort -t\"\t\" -k1,1nr | cut -f2- | head -n " rows
+      for (k in tot) {
+        t = tot[k]
+        if (t == 0) continue
+        mark = " "
+        n = split(pids[k], p, " ")
+        for (j = 1; j <= n; j++) if (p[j] in okpid) mark = "*"
+        bar = ""
+        w = int(20 * t / max)
+        for (j = 0; j < w; j++) bar = bar "="
+        row = sprintf("%s%-16s %10s %10s %10s  %s", mark, k, human(inb[k]), human(outb[k]), human(t), bar)
+        printf "%d\t%s\033[K\n", t, substr(row, 1, cols) | cmd
+      }
+      close(cmd)
+      printf "\033[J"
+      fflush()
+    }
+    { sub(/\r$/, "") }
+    /,bytes_in,bytes_out/ { sample++; if (sample >= 2) draw(); next }
+    sample == 1 { next }
+    {
+      split($0, f, ",")
+      k = f[1]; pid = k
+      sub(/\.[0-9]+$/, "", k); sub(/^.*\./, "", pid)
+      inb[k] += f[2]; outb[k] += f[3]; tot[k] = inb[k] + outb[k]
+      tin += f[2]; tout += f[3]
+      if (index(" " pids[k] " ", " " pid " ") == 0) pids[k] = pids[k] " " pid
+    }'
+}
+
+# ------------------------------------------------------------ main mode
+cmd_run() {
+  local spec m
+  load_config
+  if (( ${#ALLOW_APPS[@]} )); then
+    local -a uniq=()
+    while IFS= read -r spec; do uniq+=("$spec"); done < <(printf '%s\n' "${ALLOW_APPS[@]}" | awk '!seen[$0]++')
+    ALLOW_APPS=("${uniq[@]}")
+  fi
+  for spec in "${ALLOW_APPS[@]}"; do
+    m=$(resolve_app "$spec") || die "cannot find app: $spec"
+    vlog "$spec -> $m"
+    APP_MATCH+=("$m")
+  done
+
+  if (( DRY_RUN )); then
+    ruleset
+    echo
+    echo "# anchor \"$ANCHOR\" is rebuilt every ${POLL}s from the sockets of the allowed apps, e.g.:"
+    echo "# pass out quick proto tcp from any port { 51597 51612 } flags any"
+    echo "# pass in quick proto tcp to any port { 51597 51612 } flags any"
+    exit 0
+  fi
+
+  need_root
+  command -v lsof >/dev/null || die "lsof not found"
+  [[ -t 1 ]] || MONITOR=0
+  if (( MONITOR )) && ! command -v nettop >/dev/null; then MONITOR=0; log "nettop not found, monitor off"; fi
+
+  pfctl -s info 2>/dev/null | grep -q 'Status: Enabled' && WAS_ENABLED=1
+  vlog "pf was $( (( WAS_ENABLED )) && echo enabled || echo disabled ) before start"
+
+  trap 'cleanup; exit 130' INT
+  trap 'cleanup; exit 143' TERM HUP
+  trap cleanup EXIT
+
+  ARMED=1
+  local out
+  out=$(pfctl -E 2>&1) || die "pfctl -E failed: $out"
+  TOKEN=$(awk '/^Token/ {print $3}' <<<"$out")
+  vlog "pf enabled, token ${TOKEN:-none}"
+  out=$(ruleset | pfctl -q -f - 2>&1) || die "pf rejected the ruleset: $out"
+  pfctl -q -F states 2>/dev/null   # connections opened before netlock started must not survive
+  (( VERBOSE )) && ruleset >&2
+
+  PIDFILE=$(mktemp /tmp/netlock.XXXXXX) || die "cannot create temp file"
+  refresh
+
+  if (( MONITOR )); then
+    monitor &
+    MON_PID=$!
+  else
+    echo
+    echo "netlock ACTIVE  (Ctrl+C restores the network)"
+    echo "  blocked : all traffic in + out, every process"
+    echo "  allowed : ports ${ALLOW_PORTS[*]} (tcp/udp, all processes)"
+    echo "  allowed : apps ${ALLOW_APPS[*]:-none} (running or started later, children included)"
+    echo "  after a crash: sudo netlock restore"
+    echo
+  fi
+  while :; do
+    refresh
+    if [[ -n $MON_PID ]] && ! kill -0 "$MON_PID" 2>/dev/null; then MON_PID=""; log "monitor stopped, network still blocked"; fi
+    sleep "$POLL" &
+    SLEEP_PID=$!
+    wait "$SLEEP_PID"
+  done
+}
+
+# ----------------------------------------------------------------- args
+case ${1:-} in
+  status)         cmd_status ;;
+  restore)        cmd_restore ;;
+  setup)          log "setup is no longer needed: this version matches apps by process, not by group"; exit 0 ;;
+  -h|--help|help) usage ;;
+  *)
+    while (( $# )); do
+      case $1 in
+        --allow)
+          [[ -n ${2:-} ]] || die "--allow needs a value"
+          IFS=, read -ra parts <<<"$2"
+          ALLOW_APPS+=("${parts[@]}")
+          shift 2 ;;
+        --allow-port)
+          [[ -n ${2:-} ]] || die "--allow-port needs a value"
+          IFS=, read -ra parts <<<"$2"
+          for p in "${parts[@]}"; do
+            [[ $p =~ ^[0-9]+$ && $p -ge 1 && $p -le 65535 ]] || die "bad port: $p"
+            ALLOW_PORTS+=("$p")
+          done
+          shift 2 ;;
+        --no-monitor) MONITOR=0; shift ;;
+        --dry-run)    DRY_RUN=1; shift ;;
+        -v|--verbose) VERBOSE=1; shift ;;
+        *)            usage >&2; die "unknown argument: $1" ;;
+      esac
+    done
+    cmd_run ;;
+esac
